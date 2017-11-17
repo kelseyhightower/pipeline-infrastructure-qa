@@ -1,0 +1,140 @@
+#
+# User-defined substitutions:
+#   _CLOUDSDK_COMPUTE_ZONE
+#   _CLOUDSDK_CONTAINER_CLUSTER
+#   _GITHUB_USERNAME
+#   _KMS_KEY
+#   _KMS_KEYRING
+#
+
+steps:
+  # Generate a kubeconfig file
+  - name: 'gcr.io/cloud-builders/gcloud'
+    env:
+      - 'CLOUDSDK_COMPUTE_ZONE=${_CLOUDSDK_COMPUTE_ZONE}'
+      - 'CLOUDSDK_CONTAINER_CLUSTER=${_CLOUDSDK_CONTAINER_CLUSTER}'
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        CLUSTER=$$(gcloud config get-value container/cluster)
+        PROJECT=$$(gcloud config get-value core/project)
+        ZONE=$$(gcloud config get-value compute/zone)
+      
+        gcloud container clusters get-credentials "$${CLUSTER}" \
+          --project "$${PROJECT}" \
+          --zone "$${ZONE}"
+    volumes:
+      - name: 'kube'
+        path: /kube
+
+  # Retrieve and decrypt the GitHub Hub configuration. 
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        gsutil cp gs://${PROJECT_ID}-pipeline-configs/hub.enc hub.enc
+
+        gcloud kms decrypt \
+          --ciphertext-file=hub.enc \
+          --plaintext-file=/config/hub \
+          --location=global \
+          --keyring=${_KMS_KEYRING} \
+          --key=${_KMS_KEY}
+    volumes:
+      - name: 'config'
+        path: /config
+
+  # Update the Kubernetes deployment config.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    env:
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        kubectl apply --recursive -f kubernetes 
+    volumes:
+      - name: 'kube'
+        path: /kube
+
+  # Create a pull request on the ${_GITHUB_USERNAME}/pipeline-infrastructure-production repo
+  # to update the pipeline deployment configuration.
+  - name: 'gcr.io/hightowerlabs/hub'
+    env:
+      - 'HUB_CONFIG=/config/hub'
+      - 'KUBECONFIG=/kube/config'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        # Extract the container image from the qa pipeline deployment configuration file.
+        CONTAINER_IMAGE=$(kubectl apply --dry-run \
+           -f kubernetes/deployments/pipeline.yaml \
+           -o jsonpath='{.spec.template.spec.containers[?(@.name == "pipeline")].image}')
+
+        ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format="value(account)")
+
+        hub config --global credential.https://github.com.helper /usr/local/bin/hub-credential-helper
+        hub config --global hub.protocol https
+        hub config --global user.email "$${ACTIVE_ACCOUNT}"
+        hub config --global user.name "Google Container Builder"
+
+
+        # Clone the ${_GITHUB_USERNAME}/pipeline-infrastructure-production repo
+        # and patch the pipeline deployment container image.
+        hub clone "https://github.com/${_GITHUB_USERNAME}/pipeline-infrastructure-production.git"
+
+        cat <<EOF > patch.yaml
+        spec:
+          template:
+            spec:
+              containers:
+                - name: pipeline
+                  image: $${CONTAINER_IMAGE}
+        EOF
+
+        kubectl patch --local -o yaml \
+          -f pipeline-infrastructure-production/kubernetes/deployments/pipeline.yaml \
+          -p "$(cat patch.yaml)" \
+          > pipeline.yaml
+
+        mv pipeline.yaml pipeline-infrastructure-production/kubernetes/deployments/pipeline.yaml
+
+        # Change to the pipeline-infrastructure-production directory
+        # commit the local changes, then issue a pull request.
+        cd pipeline-infrastructure-production
+
+        git checkout -b update-deployment-${BUILD_ID}
+
+        hub add kubernetes/deployments/pipeline.yaml
+ 
+        hub commit -F- <<EOF
+        Update the pipeline deployment
+
+        This commit updates the pipeline deployment container image to:
+
+            $${CONTAINER_IMAGE}
+
+        Build ID: ${BUILD_ID}
+        EOF
+
+        hub push origin update-deployment-${BUILD_ID}
+
+        # Create a pull request to the ${_GITHUB_USERNAME}/pipeline-infrastructure-production repo.
+        hub pull-request -F- <<EOF
+        Update the pipeline deployment
+
+        This commit updates the pipeline deployment container image to:
+
+            $${CONTAINER_IMAGE}
+
+        Build ID: ${BUILD_ID}
+        EOF
+    volumes:
+      - name: 'config'
+        path: /config
+      - name: 'kube'
+        path: /kube
